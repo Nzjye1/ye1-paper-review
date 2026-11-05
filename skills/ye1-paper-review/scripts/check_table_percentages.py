@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""check_table_percentages.py — recompute every ``n (p%)`` table cell against its
+own column denominator and flag a printed percentage that does not match the count.
+
+The cheapest, highest-precision arithmetic check a reviewer can run: a
+characteristics table printing ``79 (63%)`` and ``53 (37%)`` under a denominator of
+132 is simply wrong (59.8% / 40.2%), needs no judgement or domain knowledge, and
+routinely survives multiple review rounds because it was on the page from the
+first submission. This detector parses GFM pipe tables from a manuscript, recovers
+each column's denominator, and recomputes ``100·n/denominator`` for every count/
+percentage cell.
+
+Percentage-column detection (so ``mean (SD)`` cells never fire): a column is
+treated as percentages only when a cell carries an explicit ``%`` OR its
+parenthetical values (each ≤ 100) sum to ~100 — a percentage partition. Standard
+deviations do not sum to 100 and carry no ``%``, so they are skipped.
+
+Denominator recovery, in order: a ``n = N`` in the column header; a Total/Overall
+row's count; or the column's own counts summing (a partition). A column with no
+recoverable denominator emits ``PERCENT_DENOM_UNKNOWN`` (informational only).
+
+Tolerance: by default a printed percentage must equal the recomputed one rounded to the
+printed precision, i.e. differ by at most half a unit in its last printed place (0.5 pp
+for ``15%``, 0.05 pp for ``15.0%``). A cell that misses only that printed-precision rule
+(within 0.5 pp) on a row whose label ends in a footnote marker (``^a``, ``*``, ``†``) is a
+MINOR ``PERCENT_PRECISION_NOTE``: the footnote may give the row its own denominator. ``--tol X`` replaces that with a fixed X pp for
+every cell. Whether an INFERRED denominator explains a column is still judged at the
+0.5 pp default, so tightening the cell rule never turns a flagged column into INFO.
+
+Stdlib-only. Reads the manuscript, never writes it.
+
+Usage:
+  python3 check_table_percentages.py --manuscript paper.md
+  python3 check_table_percentages.py --manuscript paper.md --strict --quiet
+  python3 check_table_percentages.py --manuscript paper.md --tol 0.5 --json
+Exit: 0 clean; with --strict, 1 on any PERCENT_MISMATCH; 2 on input/usage error.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field, asdict
+
+DEFAULT_TOL = 0.5  # percentage points: half a unit of an integer-printed percentage
+_ROUND_EPS = 1e-9  # float slack so an exact half-unit tie (1/8 = 12.5 -> "13") is not flagged
+
+CELL_RE = re.compile(r"^\s*([0-9][0-9,]*)\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*(%?)\s*\)\s*$")
+HEADER_N_RE = re.compile(r"\bn\s*=\s*([0-9][0-9,]*)", re.I)
+TOTAL_LABEL_RE = re.compile(r"^\s*(total|overall|all|entire cohort|full cohort|whole cohort)\b", re.I)
+SEP_RE = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
+# A row label that ends in a footnote marker ("Current smoker^a", "Obesity*", "BMI†",
+# "Smoker<sup>a</sup>", "Smokerᵃ"): the footnote may give the row its own denominator.
+LABEL_FOOTNOTE_RE = re.compile(r"(?:\^[A-Za-z0-9]+\^?|[*†‡§¶]+|<sup>[^<]*</sup>|[ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ]+)\s*$")
+
+
+@dataclass
+class Finding:
+    kind: str            # PERCENT_MISMATCH / PERCENT_PRECISION_NOTE / PERCENT_DENOM_UNKNOWN
+    severity: str        # MAJOR / MINOR / INFO
+    table_line: int      # 1-indexed line of the table header
+    cell: str
+    detail: str
+
+
+@dataclass
+class Report:
+    source: str
+    findings: list[Finding] = field(default_factory=list)
+
+    @property
+    def n_mismatch(self) -> int:
+        return sum(1 for f in self.findings if f.kind == "PERCENT_MISMATCH")
+
+    @property
+    def verdict(self) -> str:
+        return "MISMATCH FOUND" if self.n_mismatch else "OK"
+
+
+def _split_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _parse_tables(text: str):
+    """Yield (header_cells, data_rows, header_line_no) for each GFM pipe table."""
+    lines = text.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        if "|" in lines[i] and i + 1 < n and SEP_RE.match(lines[i + 1]) and "-" in lines[i + 1]:
+            header = _split_row(lines[i])
+            rows, j = [], i + 2
+            while j < n and "|" in lines[j] and lines[j].strip():
+                rows.append(_split_row(lines[j]))
+                j += 1
+            yield header, rows, i + 1
+            i = j
+        else:
+            i += 1
+
+
+def _cell_count_pct(cell: str):
+    m = CELL_RE.match(cell)
+    if not m:
+        return None
+    count = int(m.group(1).replace(",", ""))
+    pct = float(m.group(2))
+    has_pct = m.group(3) == "%"
+    return count, pct, has_pct
+
+
+def _pct_text(raw: str) -> str:
+    """The percentage exactly as printed ("15.0", not 15)."""
+    m = CELL_RE.match(raw)
+    return m.group(2) if m else ""
+
+
+def _printed_tol(raw: str) -> float:
+    """Half a unit in the last printed place of the cell's percentage."""
+    num = _pct_text(raw)
+    decimals = len(num.split(".", 1)[1]) if "." in num else 0
+    return 0.5 * 10 ** (-decimals) + _ROUND_EPS
+
+
+def audit(text: str, source: str, tol: float | None = None) -> Report:
+    """tol=None: per-cell tolerance from the printed precision; a number: fixed pp."""
+    fit_tol = DEFAULT_TOL if tol is None else tol
+    rep = Report(source=source)
+    for header, rows, lineno in _parse_tables(text):
+        ncols = len(header)
+        data_rows = [r for r in rows if r and not TOTAL_LABEL_RE.match(r[0])]
+        total_rows = [r for r in rows if r and TOTAL_LABEL_RE.match(r[0])]
+
+        for col in range(1, ncols):  # col 0 is the row label
+            # gather count/pct cells in this column
+            parsed = []
+            for r in data_rows:
+                if col < len(r):
+                    cp = _cell_count_pct(r[col])
+                    if cp:
+                        parsed.append((r[0], r[col], *cp))  # label, raw, count, pct, has_pct
+            if not parsed:
+                continue
+
+            # is this a percentage column?
+            has_pct = any(p[4] for p in parsed)
+            le100 = [p[3] for p in parsed if p[3] <= 100]
+            is_partition = len(le100) >= 2 and 98.0 <= sum(le100) <= 102.0
+            if not (has_pct or is_partition):
+                continue  # e.g. mean (SD): no %, SDs don't sum to 100
+
+            # recover denominator
+            denom = None
+            src = ""
+            if col < len(header):
+                hm = HEADER_N_RE.search(header[col])
+                if hm:
+                    denom, src = int(hm.group(1).replace(",", "")), "header n="
+            if denom is None:
+                for tr in total_rows:
+                    if col < len(tr):
+                        tc = CELL_RE.match(tr[col]) or re.match(r"^\s*([0-9][0-9,]*)\s*$", tr[col])
+                        if tc:
+                            denom, src = int(tc.group(1).replace(",", "")), "Total row"
+                            break
+            # Summing a column's counts is a denominator only for a partition — mutually exclusive
+            # categories accounting for everyone. For the most common table in clinical research, a
+            # Table 1 of independent binary characteristics with N declared in the CAPTION, the sum
+            # is a meaningless number larger than N, and using it accused every correct cell of bad
+            # arithmetic while printing a specific wrong replacement percentage.
+            #
+            # Gating on `is_partition` is NOT the fix: that flag is computed from the printed
+            # percentages summing to ~100, so a partition with a wrong percentage stops looking like
+            # a partition — the check would go silent on exactly the error it exists to catch.
+            #
+            # The denominator is INFERRED here, unlike a header `n =` or a Total row, which the
+            # author declared. So it must earn its use: keep it only if it explains at least one
+            # cell. A denominator that reconciles nothing is not evidence that every cell is wrong,
+            # it is evidence that it is the wrong denominator. Verified below, after recomputation.
+            inferred = False
+            if denom is None:
+                denom, src, inferred = sum(p[2] for p in parsed), "column count-sum", True
+
+            if not denom:
+                rep.findings.append(Finding("PERCENT_DENOM_UNKNOWN", "INFO", lineno,
+                                            f"column {col}", "percentage column with no recoverable denominator"))
+                continue
+
+            column_findings: list[Finding] = []
+            reconciled = 0
+            for label, raw, count, pct, _hp in parsed:
+                if count > denom:
+                    continue  # not a proportion of this denominator
+                recomputed = 100.0 * count / denom
+                diff = abs(recomputed - pct)
+                cell_tol = _printed_tol(raw) if tol is None else tol
+                if diff > cell_tol:
+                    shown = 1 if diff >= 0.05 else 2
+                    msg = (f"printed {_pct_text(raw) or format(pct, 'g')}% but {count}/{denom} ({src}) = {recomputed:.{max(1, shown)}f}% "
+                           f"(Δ{diff:.{shown}f}pp)")
+                    if tol is None and diff <= DEFAULT_TOL and LABEL_FOOTNOTE_RE.search(label):
+                        # Off only at the printed precision, on a footnoted row: the footnote
+                        # may give the row its own (missing-data) denominator, which the table
+                        # does not show. Advisory, not a Major.
+                        column_findings.append(Finding(
+                            "PERCENT_PRECISION_NOTE", "MINOR", lineno, f"{label}: {raw}",
+                            msg + "; the row label carries a footnote marker, so its denominator "
+                                  "may differ from the column's (e.g. missing data): confirm "
+                                  "against the footnote"))
+                    else:
+                        column_findings.append(Finding(
+                            "PERCENT_MISMATCH", "MAJOR", lineno, f"{label}: {raw}", msg))
+                if diff <= fit_tol:
+                    reconciled += 1
+
+            # An inferred denominator that reconciles NOTHING is the wrong denominator, not proof
+            # that every cell is wrong. Report the gap rather than the accusation. A declared
+            # denominator (header `n =`, Total row) is never second-guessed this way: if the author
+            # states N and the arithmetic disagrees, that is the finding.
+            if inferred and column_findings and reconciled == 0:
+                rep.findings.append(Finding(
+                    "PERCENT_DENOM_UNKNOWN", "INFO", lineno, f"column {col}",
+                    f"percentage column with no declared denominator; the column count-sum "
+                    f"({denom}) reconciles none of {len(column_findings)} cell(s), so it is not the "
+                    f"denominator — declare N in the column header (n = N) or a Total row to check"))
+            else:
+                rep.findings.extend(column_findings)
+    return rep
+
+
+def format_report(rep: Report, color: bool) -> str:
+    tag = {"OK": "\033[92m", "MISMATCH FOUND": "\033[91m"}.get(rep.verdict, "") if color else ""
+    end = "\033[0m" if color else ""
+    lines = [f"{tag}== {rep.verdict} =={end}  {rep.source}",
+             f"mismatches={rep.n_mismatch} findings={len(rep.findings)}"]
+    if not rep.findings:
+        lines.append("all n (%) cells reconcile with their column denominators.")
+        return "\n".join(lines)
+    for f in sorted(rep.findings, key=lambda x: (x.kind != "PERCENT_MISMATCH", x.table_line, x.cell)):
+        lines.append(f"[{f.severity:<5}] {f.kind:<22} L{f.table_line}  {f.detail}")
+        lines.append(f"        cell> {f.cell}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--manuscript", required=True, help="manuscript markdown/text with GFM tables")
+    ap.add_argument("--tol", type=float, default=None,
+                    help="fixed flag threshold in percentage points (default: half a unit in "
+                         "the last printed place of each cell, e.g. 0.5 for '15%%', 0.05 for '15.0%%')")
+    ap.add_argument("--strict", action="store_true", help="exit 1 if any PERCENT_MISMATCH")
+    ap.add_argument("--quiet", action="store_true", help="suppress the report; exit code only")
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of a text report")
+    ap.add_argument("--out", help="write the JSON artifact to this path")
+    args = ap.parse_args(argv)
+
+    try:
+        text = open(args.manuscript, encoding="utf-8").read()
+    except OSError as e:
+        print(f"error: cannot read manuscript: {e}", file=sys.stderr)
+        return 2
+
+    rep = audit(text, source=args.manuscript, tol=args.tol)
+    payload = {"source": rep.source, "verdict": rep.verdict,
+               "n_mismatch": rep.n_mismatch, "findings": [asdict(f) for f in rep.findings]}
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump({"detector": "check_table_percentages", **payload}, fh, ensure_ascii=False, indent=2)
+
+    if not args.quiet:
+        print(json.dumps({"detector": "check_table_percentages", **payload}, ensure_ascii=False, indent=2) if args.json
+              else format_report(rep, color=sys.stdout.isatty()))
+
+    return 1 if (args.strict and rep.n_mismatch) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
