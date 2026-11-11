@@ -1,77 +1,88 @@
 #!/usr/bin/env python3
-"""Safely run MedSci's macOS Word Compare helper in an isolated directory."""
+"""Compare two Word files using Word on macOS, then audit the saved result."""
 import argparse
-from collections import Counter
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
+import os
+from lxml import etree as ET
 import zipfile
 from pathlib import Path
+from ye1_revision_check import audit, load, marks
 
+APPLESCRIPT=r'''
+on run argv
+  set seedPath to item 1 of argv
+  set changedPath to item 2 of argv
+  set authorName to item 3 of argv
+  set waitSeconds to (item 4 of argv) as integer
+  with timeout of waitSeconds seconds
+    tell application "Microsoft Word"
+      open POSIX file seedPath
+      set workingDoc to active document
+      compare workingDoc path changedPath author name authorName target compare target current detect format changes false ignore all comparison warnings true
+      save workingDoc
+      close workingDoc saving no
+    end tell
+  end timeout
+end run
+'''
 
-def comment_signatures(path):
-    w = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-    with zipfile.ZipFile(path) as archive:
-        if 'word/comments.xml' not in archive.namelist():
-            return Counter()
-        root = ET.fromstring(archive.read('word/comments.xml'))
-    return Counter((item.get(w + 'author', ''), ''.join(t.text or '' for t in item.iter(w + 't')))
-                   for item in root.iter(w + 'comment'))
+def add_line_numbers(path):
+    ns='{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    part=path.with_suffix('.line-numbers.tmp')
+    try:
+        with zipfile.ZipFile(path) as source, zipfile.ZipFile(part,'w') as target:
+            for info in source.infolist():
+                data=source.read(info.filename)
+                if info.filename=='word/document.xml':
+                    root=ET.fromstring(data)
+                    for section in root.iter(ns+'sectPr'):
+                        if section.find(ns+'lnNumType') is not None:continue
+                        number=ET.Element(ns+'lnNumType',{ns+'countBy':'1',ns+'restart':'continuous'})
+                        children=list(section); margin=section.find(ns+'pgMar')
+                        section.insert(children.index(margin)+1 if margin is not None else 0,number)
+                    data=ET.tostring(root,encoding='utf-8',xml_declaration=True)
+                target.writestr(info,data)
+        os.replace(part,path)
+    finally:part.unlink(missing_ok=True)
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--original', required=True)
-    p.add_argument('--revised', required=True)
-    p.add_argument('--out', required=True)
-    p.add_argument('--author', default='Ye1')
-    p.add_argument('--timeout', type=int, default=300)
-    a = p.parse_args()
-    original, revised, out = (Path(x).expanduser().resolve() for x in (a.original, a.revised, a.out))
-    if sys.platform != 'darwin':
-        raise SystemExit('This helper needs macOS and Microsoft Word; use a host Word tool on other systems.')
-    if not original.is_file() or not revised.is_file():
-        raise SystemExit('Original and revised DOCX must both exist.')
-    if out.exists() or out in (original, revised):
-        raise SystemExit('Output must be a new file, not an input or existing file.')
-    if out.suffix.lower() != '.docx' or not out.parent.is_dir():
-        raise SystemExit('Output must be a DOCX in an existing directory.')
-    helper = Path(__file__).with_name('build_marked_manuscript.py')
-    with tempfile.TemporaryDirectory(prefix='ye1-word-compare-') as tmp:
-        candidate = Path(tmp) / 'marked.docx'
-        cmd = [sys.executable, str(helper), '--original', str(original), '--revised', str(revised),
-               '--out', str(candidate), '--author', a.author, '--timeout', str(a.timeout)]
+    p=argparse.ArgumentParser(description=__doc__)
+    for name in ('original','revised','out'):p.add_argument('--'+name,required=True,type=Path)
+    p.add_argument('--author',default='Ye1');p.add_argument('--timeout',type=int,default=300);p.add_argument('--line-numbers',action='store_true',help='按需添加连续行号')
+    a=p.parse_args()
+    if sys.platform!='darwin':p.error('该工具需要 macOS 和 Microsoft Word；其他系统使用宿主的 Word 比较功能。')
+    for f in (a.original,a.revised):
+        if not f.is_file():p.error(f'输入不存在: {f}')
+        if marks(load(f)[0])[0]:p.error('输入含未决修订；保留原有修订并使用适合的 Word 工具处理。')
+    if a.out.exists() or a.out.suffix.lower()!='.docx' or not a.out.parent.is_dir():p.error('输出必须是已有目录中的新 DOCX 文件。')
+    base=Path.home()/'Library/Containers/com.microsoft.Word/Data/Documents'
+    if not base.is_dir():p.error('未找到 Word 容器；先启动 Word 并检查文件访问权限。')
+    with tempfile.TemporaryDirectory(prefix='ye1-compare-',dir=base) as folder:
+        temp=Path(folder);source=temp/(temp.name+'-base.docx');change=temp/(temp.name+'-changed.docx')
+        shutil.copyfile(a.original,source);shutil.copyfile(a.revised,change)
         try:
-            run = subprocess.run(cmd, text=True, capture_output=True, timeout=a.timeout + 60)
+            result=subprocess.run(['osascript','-',str(source),str(change),a.author,str(a.timeout)],input=APPLESCRIPT,text=True,capture_output=True,timeout=a.timeout+15)
         except subprocess.TimeoutExpired:
-            raise SystemExit('Word did not finish; no result was saved.')
-        if run.returncode != 0 or not candidate.is_file():
-            print(run.stdout, end='', file=sys.stderr)
-            print(run.stderr, end='', file=sys.stderr)
-            raise SystemExit('Compare or its verification failed; no result was saved.')
+            raise SystemExit('Word 操作超时；请检查 Word 是否有权限或提示窗口。本工具未写入输出。')
+        if result.returncode:raise SystemExit('Word 比较失败；本工具未写入输出：'+result.stderr.strip())
+        if a.line_numbers:add_line_numbers(source)
+        outcome=audit(source,a.original,a.revised,a.author)
+        if outcome['issues']:
+            print(json.dumps(outcome,ensure_ascii=False,indent=2))
+            raise SystemExit('比较结果存在待核问题，未写入输出。')
+        created=False
         try:
-            before, after, result = (comment_signatures(path) for path in (original, revised, candidate))
-            expected = before | after
-            if result - expected:
-                print('NOTE: Word Compare may have duplicated comments; inspect before delivery.')
-            if expected - result:
-                print('NOTE: Some existing comments may be missing; inspect before delivery.')
-        except (OSError, zipfile.BadZipFile, ET.ParseError):
-            print('NOTE: Comment preservation could not be checked; inspect before delivery.')
-        created = False
-        try:
-            with out.open('xb') as target, candidate.open('rb') as source:
-                created = True
-                shutil.copyfileobj(source, target)
+            with a.out.open('xb') as dst, source.open('rb') as src:
+                created=True;shutil.copyfileobj(src,dst)
         except Exception:
-            if created:
-                out.unlink(missing_ok=True)
+            if created:a.out.unlink(missing_ok=True)
             raise
-        print(run.stdout, end='')
-        print(f'Output: {out}')
+        print(json.dumps(outcome,ensure_ascii=False,indent=2))
+        print('已生成:',a.out)
 
-
-if __name__ == '__main__':
-    main()
+if __name__=='__main__':main()

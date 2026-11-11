@@ -2,7 +2,7 @@
 name: ye1-paper-review
 description: 检查已有医学科研论文的研究逻辑、结果和图表一致性、文献及报告规范，按位置给出改进建议，并可在 Word 中添加原生批注；适合整篇或指定章节的自查。
 metadata:
-  version: "0.4.2-dev"
+  version: "0.4.3-dev"
   display_name: "Ye1 医学论文检查"
 ---
 
@@ -18,11 +18,13 @@ metadata:
 
 先告诉医生重要问题、位置、依据和可执行建议，区分确定的问题与待核事项，说明实际检查范围。可处理的 DOCX 默认交付带 Word 原生批注的副本和简明问题清单；医生要求修改时，直接处理有依据的部分。使用 [Word 处理与环境](references/Word处理与环境.md) 中的工具或宿主能力，Agent 自行准备必要环境。无法处理的部分如实说明。
 
+医生要求“检查并修改”时，沿用同一稿件直接完成已授权、有依据的修改；结构、章节内容或论证需要较大调整时，可接续论文写作（`ye1-paper-writing`），带入问题位置、依据、作者决定和未核项。对应能力不可用时继续完成现有条件支持的部分。修改完成后只复核受影响的问题及正文、表图和引用的一致性；医生只要求检查时，交付检查结果，不自动扩大为全文重写。
+
 ## 可用脚本
 
 - `scripts/ye1_table_check.py manuscript.docx` 或传入 Markdown：辅助检查可识别表格中的人数和百分比。覆盖范围有限；结合实际表格及分母核算，空结果不代表全部正确。
-- `scripts/verify_refs.py`：按 [引用核对](references/引用核对.md) 使用，网络不通或题录未解析的条目保留待核；它不验证文献是否支持具体观点。
-- `scripts/check_rewrite_fidelity.py`、`scripts/check_medical_fidelity.py`、`scripts/check_academic_invariants.py`：需要比较改写前后的文字时辅助核对，范围和限制见 [学术表达自然化](references/学术表达自然化.md)。
+- `scripts/ye1_reference_audit.py`：按 [引用核对](references/引用核对.md) 使用，网络不通或题录未解析的条目保留待核；它不验证文献是否支持具体观点。
+- `scripts/ye1_fidelity_audit.py`：需要比较改写前后的文字时辅助核对，范围和限制见 [学术表达自然化](references/学术表达自然化.md)。
 - `scripts/ye1_word.py`：读取和原生批注 Word，并可按要求输出修订痕迹。文件操作方式及限制见 [Word 处理与环境](references/Word处理与环境.md)。
 
 检查中若有需要补查的文献，可在 Ye1 医学文献调研实际可用时带入稿件研究问题和来源、针对性补查并接回；没有时利用本包与宿主已有工具继续。检查结论不是投稿或发表保证。若医生要求独立去 AI 味、大幅重写、学术返修或投稿，且对应能力实际可用，继续沿用同一份稿件、问题和来源；不可用时完成本次检查，按需要简短推荐一个适合的能力。检查本身无需其他 Skill。第三方代码及许可见 [第三方说明](licenses/THIRD-PARTY.md)。
